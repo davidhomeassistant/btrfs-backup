@@ -34,10 +34,15 @@ fi
 
 # validate config has been edited
 source "$CONFIG_FILE"
-if [[ -z "${HOSTNAME_ID:-}" || "$HOSTNAME_ID" == "hypervisor1" ]]; then
+if [[ -z "${HOSTNAME_ID:-}" ]]; then
     echo ""
-    echo "WARNING: HOSTNAME_ID is still the default value."
+    echo "WARNING: HOSTNAME_ID is empty."
     echo "Please edit ${CONFIG_FILE} before running the backup."
+    echo ""
+fi
+if [[ -z "${JOBS[*]:-}" ]]; then
+    echo "WARNING: No JOBS defined."
+    echo "Please edit ${CONFIG_FILE} and add your backup jobs."
     echo ""
 fi
 
