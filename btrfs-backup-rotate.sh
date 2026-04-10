@@ -390,10 +390,10 @@ _do_remote() {
     local job_name="$1" source_path="$2"
     local -n _rsnaps_src=$3
 
-    local rem_var="${job_name}_REMOTE"; local remote_spec="${!rem_var}"
-    local host="${remote_spec%%:*}"
-    local rpath="${remote_spec#*:}"
-    [[ -z "$host" || -z "$rpath" ]] && { log_error "Bad remote spec: ${remote_spec}"; return 1; }
+    local rh_var="${job_name}_REMOTE_HOST"; local rhost="${!rh_var}"
+    local ru_var="${job_name}_REMOTE_USER"; local ruser="${!ru_var}"
+    local rp_var="${job_name}_REMOTE_PATH"; local rpath="${!rp_var}"
+    local host="${ruser}@${rhost}"
 
     log_info "  remote: ${host}:${rpath}"
 
@@ -482,8 +482,12 @@ load_config() {
             local arch_var="${job}_ARCHIVE"
             [[ -z "${!arch_var:-}" ]] && die "Job '${job}': ${arch_var} is required for local mode"
         else
-            local rem_var="${job}_REMOTE"
-            [[ -z "${!rem_var:-}" ]] && die "Job '${job}': ${rem_var} is required for remote mode"
+            local rh_var="${job}_REMOTE_HOST"
+            local ru_var="${job}_REMOTE_USER"
+            local rp_var="${job}_REMOTE_PATH"
+            [[ -z "${!rh_var:-}" ]] && die "Job '${job}': ${rh_var} is required for remote mode"
+            [[ -z "${!ru_var:-}" ]] && die "Job '${job}': ${ru_var} is required for remote mode"
+            [[ -z "${!rp_var:-}" ]] && die "Job '${job}': ${rp_var} is required for remote mode"
         fi
     done
 

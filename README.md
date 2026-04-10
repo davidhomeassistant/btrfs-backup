@@ -60,29 +60,33 @@ See [`config.example.sh`](config.example.sh) for a fully commented template.
 
 List job names in `JOBS`, then define each one below. Each job is **either local or remote** (never both):
 
-- **local** — archive snapshots to another BTRFS volume on the same host
-- **remote** — send snapshots to another host via SSH
+- **local** — move old snapshots to another disk on this host
+- **remote** — send old snapshots to another host via SSH
 
 ```bash
 JOBS=("win_b" "linux_vm")
 
-# --- Job: win_b (remote) ---
-win_b_SOURCE="/work/backup"
+# --- win_b: send to remote host ---
 win_b_MODE="remote"
-win_b_REMOTE="root@192.168.12.250:/backup/win_b"
+win_b_SOURCE="/work/backup"
+win_b_REMOTE_HOST="192.168.12.250"
+win_b_REMOTE_USER="root"
+win_b_REMOTE_PATH="/backup/win_b"
 
-# --- Job: linux_vm (local) ---
-linux_vm_SOURCE="/data/backup"
+# --- linux_vm: archive to local disk ---
 linux_vm_MODE="local"
+linux_vm_SOURCE="/data/backup"
 linux_vm_ARCHIVE="/backuparchive/linux_vm"
 ```
 
 | Variable | When | Description |
 |---|---|---|
-| `<job>_SOURCE` | always | Directory containing `YYYY_MM_DD` snapshot subvolumes |
 | `<job>_MODE` | always | `"local"` or `"remote"` |
-| `<job>_ARCHIVE` | local mode | Destination on a different BTRFS volume (same host) |
-| `<job>_REMOTE` | remote mode | `user@host:/path` for SSH send |
+| `<job>_SOURCE` | always | Directory with `YYYY_MM_DD` snapshots |
+| `<job>_ARCHIVE` | local | Target path on another BTRFS disk |
+| `<job>_REMOTE_HOST` | remote | IP or hostname of the target server |
+| `<job>_REMOTE_USER` | remote | SSH user on the target server |
+| `<job>_REMOTE_PATH` | remote | Path on the target server |
 
 ## CLI flags
 
