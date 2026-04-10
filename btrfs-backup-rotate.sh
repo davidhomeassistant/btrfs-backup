@@ -303,7 +303,7 @@ trim_archive() {
 process_job() {
     local job_name="$1"
 
-    local src_var="${job_name}_SOURCE" ; local source_path="${!src_var}"
+    local src_var="${job_name}_SOURCE" ; local source_path="${!src_var%/}"
     local mode_var="${job_name}_MODE"  ; local mode="${!mode_var}"
 
     log_info "━━━ Job: ${job_name} (${mode}) ━━━"
@@ -331,7 +331,7 @@ _do_local() {
     local job_name="$1" source_path="$2"
     local -n _lsnaps=$3
 
-    local arch_var="${job_name}_ARCHIVE"; local archive_path="${!arch_var}"
+    local arch_var="${job_name}_ARCHIVE"; local archive_path="${!arch_var%/}"
     log_info "  archive: ${archive_path}"
 
     local total=${#_lsnaps[@]}
@@ -392,7 +392,7 @@ _do_remote() {
 
     local rh_var="${job_name}_REMOTE_HOST"; local rhost="${!rh_var}"
     local ru_var="${job_name}_REMOTE_USER"; local ruser="${!ru_var}"
-    local rp_var="${job_name}_REMOTE_PATH"; local rpath="${!rp_var}"
+    local rp_var="${job_name}_REMOTE_PATH"; local rpath="${!rp_var%/}"
     local host="${ruser}@${rhost}"
 
     log_info "  remote: ${host}:${rpath}"
