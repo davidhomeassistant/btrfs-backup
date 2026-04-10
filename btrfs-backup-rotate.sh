@@ -1,39 +1,33 @@
 #!/usr/bin/env bash
 #
-# btrfs-backup-rotate.sh — BTRFS snapshot rotation, archival & remote replication
+# btrfs-backup-rotate.sh — BTRFS snapshot rotation & backup
 #
-# Keeps N most recent snapshots locally, archives older ones to a separate
-# BTRFS volume, optionally replicates to remote hosts via SSH, and sends
-# Telegram notifications on success or failure.
-#
-# SAFETY: supports --dry-run, lock files, verification after every send,
-#         and never deletes a source snapshot unless the archive copy is confirmed.
+# LOCAL mode:  archive old snapshots to another disk, then delete from source
+# REMOTE mode: ensure kept snapshots are on remote host, then delete old from source
 #
 
 set -euo pipefail
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly LOCK_DIR="/var/run"
 readonly DEFAULT_LOG="/var/log/btrfs-backup.log"
 readonly SNAP_RE='^[0-9]{4}_[0-9]{2}_[0-9]{2}$'
 
-# --- globals set by config ---
 HOSTNAME_ID=""
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 KEEP_LOCAL=2
-KEEP_ARCHIVE=0          # 0 = unlimited
+KEEP_ARCHIVE=0
 LOG_FILE="$DEFAULT_LOG"
 declare -a JOBS=()
 
-# --- runtime state ---
 DRY_RUN=false
 VERBOSE=false
 CONFIG_FILE=""
 LOCK_FILE=""
+ONLY_JOBS=()
 declare -a ERRORS=()
-declare -a WARNINGS=()
 declare -a SUMMARY=()
 
 ###############################################################################
@@ -44,17 +38,13 @@ usage() {
     cat <<EOF
 Usage: $SCRIPT_NAME -c CONFIG [OPTIONS]
 
-Options:
-  -c, --config FILE   Configuration file (required)
-  -n, --dry-run       Show what would happen without touching anything
-  -v, --verbose       Debug-level output
-  -j, --job NAME      Run only the named job (may be repeated)
-  -h, --help          This message
-  --version           Print version
+  -c, --config FILE   Config file (required)
+  -n, --dry-run       Show what would happen, change nothing
+  -v, --verbose       More output
+  -j, --job NAME      Run only this job
+  -h, --help          Help
 EOF
 }
-
-ONLY_JOBS=()
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -65,11 +55,11 @@ parse_args() {
             -j|--job)     ONLY_JOBS+=("$2"); shift 2 ;;
             -h|--help)    usage; exit 0 ;;
             --version)    echo "$SCRIPT_NAME v$SCRIPT_VERSION"; exit 0 ;;
-            *)            echo "Unknown option: $1" >&2; usage; exit 1 ;;
+            *)            echo "Unknown: $1" >&2; usage; exit 1 ;;
         esac
     done
-    [[ -z "$CONFIG_FILE" ]] && { echo "Error: -c CONFIG is required" >&2; usage; exit 1; }
-    [[ -f "$CONFIG_FILE" ]] || { echo "Error: config not found: $CONFIG_FILE" >&2; exit 1; }
+    [[ -z "$CONFIG_FILE" ]] && { echo "Error: -c CONFIG required" >&2; exit 1; }
+    [[ -f "$CONFIG_FILE" ]] || { echo "Error: $CONFIG_FILE not found" >&2; exit 1; }
 }
 
 ###############################################################################
@@ -77,13 +67,11 @@ parse_args() {
 ###############################################################################
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
-
-log_info()  { local m="[$(_ts)] [INFO]  $*"; echo "$m" | tee -a "$LOG_FILE"; }
-log_warn()  { local m="[$(_ts)] [WARN]  $*"; echo "$m" | tee -a "$LOG_FILE" >&2; WARNINGS+=("$*"); }
-log_error() { local m="[$(_ts)] [ERROR] $*"; echo "$m" | tee -a "$LOG_FILE" >&2; ERRORS+=("$*"); }
-log_debug() { $VERBOSE && { local m="[$(_ts)] [DEBUG] $*"; echo "$m" | tee -a "$LOG_FILE"; } || true; }
-
-die() { log_error "$*"; send_notification "FAILED"; release_lock; exit 1; }
+log_info()  { echo "[$(_ts)] [INFO]  $*" | tee -a "$LOG_FILE"; }
+log_warn()  { echo "[$(_ts)] [WARN]  $*" | tee -a "$LOG_FILE" >&2; }
+log_error() { echo "[$(_ts)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; ERRORS+=("$*"); }
+log_debug() { $VERBOSE && echo "[$(_ts)] [DEBUG] $*" | tee -a "$LOG_FILE" || true; }
+die()       { log_error "$*"; notify "FAILED"; release_lock; exit 1; }
 
 ###############################################################################
 # Lock
@@ -92,48 +80,25 @@ die() { log_error "$*"; send_notification "FAILED"; release_lock; exit 1; }
 acquire_lock() {
     LOCK_FILE="${LOCK_DIR}/btrfs-backup-${HOSTNAME_ID}.lock"
     if [[ -f "$LOCK_FILE" ]]; then
-        local pid
-        pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+        local pid; pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            die "Another instance running (PID $pid). Lock: $LOCK_FILE"
+            die "Already running (PID $pid)"
         fi
-        log_warn "Removing stale lock (was PID $pid)"
         rm -f "$LOCK_FILE"
     fi
     echo $$ > "$LOCK_FILE"
     trap release_lock EXIT
 }
-
-release_lock() {
-    [[ -n "${LOCK_FILE:-}" && -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
-}
+release_lock() { [[ -n "${LOCK_FILE:-}" && -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"; }
 
 ###############################################################################
 # Telegram
 ###############################################################################
 
-send_telegram() {
-    local text="$1"
-    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
-    if $DRY_RUN; then
-        log_info "[DRY-RUN] Telegram → ${text:0:120}…"
-        return 0
-    fi
-    curl -s --max-time 15 -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=${text}" \
-        -d "parse_mode=HTML" >/dev/null 2>&1 \
-    || log_warn "Telegram delivery failed"
-}
-
-send_notification() {
+notify() {
     local status="$1"
-    local icon="❌"
-    [[ "$status" == "OK" ]] && icon="✅"
-
-    local msg="${icon} <b>[${HOSTNAME_ID}]</b> Backup rotation: <b>${status}</b>"
-
+    local icon="❌"; [[ "$status" == "OK" ]] && icon="✅"
+    local msg="${icon} <b>[${HOSTNAME_ID}]</b> ${status}"
     if [[ ${#SUMMARY[@]} -gt 0 ]]; then
         msg+=$'\n'
         for s in "${SUMMARY[@]}"; do msg+=$'\n'"• ${s}"; done
@@ -142,322 +107,242 @@ send_notification() {
         msg+=$'\n\n'"<b>Errors:</b>"
         for e in "${ERRORS[@]}"; do msg+=$'\n'"⚠️ ${e}"; done
     fi
-    $DRY_RUN && msg+=$'\n\n'"<i>(dry-run, no changes made)</i>"
+    $DRY_RUN && msg+=$'\n\n'"<i>(dry-run)</i>"
 
-    send_telegram "$msg"
+    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+    if $DRY_RUN; then log_info "[DRY-RUN] Telegram message prepared"; return 0; fi
+    curl -s --max-time 15 -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TELEGRAM_CHAT_ID}" \
+        -d "text=${msg}" \
+        -d "parse_mode=HTML" >/dev/null 2>&1 \
+    || log_warn "Telegram send failed"
 }
 
 ###############################################################################
 # Snapshot helpers
 ###############################################################################
 
-# Print snapshot directory names matching YYYY_MM_DD, sorted ascending.
 get_snapshots() {
     local dir="$1"
     [[ -d "$dir" ]] || return 0
-    local name
     for d in "$dir"/*/; do
         [[ -d "$d" ]] || continue
-        name="$(basename "$d")"
+        local name; name="$(basename "$d")"
         [[ "$name" =~ $SNAP_RE ]] && echo "$name"
     done | sort
 }
 
-snap_exists_local() { [[ -d "$1/$2" ]]; }
-
-snap_exists_remote() {
-    local host="$1" path="$2" name="$3"
-    ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
-        "test -d '${path}/${name}'" 2>/dev/null
+in_list() {
+    local needle="$1"; shift
+    for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
+    return 1
 }
 
-# Given an array of snapshot names present at the target and the source path,
-# return the most recent common parent older than $current.
+# Find best parent: most recent snapshot older than $current that exists
+# in both source and target.
 find_parent() {
-    local source_path="$1" current="$2"
-    shift 2
-    local -a target_list=("$@")
-
-    local -a src_snaps
-    mapfile -t src_snaps < <(get_snapshots "$source_path")
-
+    local src="$1" current="$2"; shift 2
+    local -a target=("$@")
+    local -a srcs; mapfile -t srcs < <(get_snapshots "$src")
     local best=""
-    for s in "${src_snaps[@]}"; do
+    for s in "${srcs[@]}"; do
         [[ "$s" < "$current" ]] || continue
-        for t in "${target_list[@]}"; do
-            [[ "$s" == "$t" ]] && { best="$s"; break; }
-        done
+        in_list "$s" "${target[@]}" && best="$s"
     done
     echo "$best"
 }
 
 ###############################################################################
-# Send operations
+# btrfs send/receive
 ###############################################################################
 
-btrfs_send_local() {
+send_local() {
     local src="$1" snap="$2" dst="$3" parent="${4:-}"
-    local full="${src}/${snap}"
-
     if $DRY_RUN; then
-        if [[ -n "$parent" ]]; then
-            log_info "[DRY-RUN] btrfs send -p ${src}/${parent} ${full} | btrfs receive ${dst}/"
-        else
-            log_info "[DRY-RUN] btrfs send ${full} | btrfs receive ${dst}/"
-        fi
+        [[ -n "$parent" ]] \
+            && log_info "[DRY-RUN] btrfs send -p ${src}/${parent} ${src}/${snap} | btrfs receive ${dst}/" \
+            || log_info "[DRY-RUN] btrfs send ${src}/${snap} | btrfs receive ${dst}/"
         return 0
     fi
-
     mkdir -p "$dst"
-
     local cmd
-    if [[ -n "$parent" ]]; then
-        log_info "Incremental send ${snap} (parent ${parent}) → ${dst}/"
-        cmd="btrfs send -p '${src}/${parent}' '${full}' | btrfs receive '${dst}/'"
-    else
-        log_info "Full send ${snap} → ${dst}/"
-        cmd="btrfs send '${full}' | btrfs receive '${dst}/'"
-    fi
-
+    [[ -n "$parent" ]] \
+        && { log_info "Send ${snap} (parent ${parent}) → ${dst}/"; cmd="btrfs send -p '${src}/${parent}' '${src}/${snap}' | btrfs receive '${dst}/'"; } \
+        || { log_info "Full send ${snap} → ${dst}/"; cmd="btrfs send '${src}/${snap}' | btrfs receive '${dst}/'"; }
     if ! eval "$cmd" 2>>"$LOG_FILE"; then
-        log_error "btrfs send failed: ${snap} → ${dst}"
-        [[ -d "${dst}/${snap}" ]] && \
-            { btrfs subvolume delete "${dst}/${snap}" 2>/dev/null || rm -rf "${dst}/${snap}" 2>/dev/null || true; }
+        log_error "Send failed: ${snap} → ${dst}"
+        [[ -d "${dst}/${snap}" ]] && { btrfs subvolume delete "${dst}/${snap}" 2>/dev/null || true; }
         return 1
     fi
-
-    snap_exists_local "$dst" "$snap" || { log_error "Verification failed: ${dst}/${snap} missing after send"; return 1; }
-    log_info "Archived ${snap} ✓"
+    [[ -d "${dst}/${snap}" ]] || { log_error "Verify failed: ${dst}/${snap}"; return 1; }
+    log_info "OK: ${snap} → ${dst}"
 }
 
-btrfs_send_remote() {
+send_remote() {
     local src="$1" snap="$2" host="$3" rpath="$4" parent="${5:-}"
-    local full="${src}/${snap}"
-
     if $DRY_RUN; then
-        if [[ -n "$parent" ]]; then
-            log_info "[DRY-RUN] btrfs send -p ${src}/${parent} ${full} | ssh ${host} btrfs receive ${rpath}/"
-        else
-            log_info "[DRY-RUN] btrfs send ${full} | ssh ${host} btrfs receive ${rpath}/"
-        fi
+        [[ -n "$parent" ]] \
+            && log_info "[DRY-RUN] btrfs send -p ${src}/${parent} ${src}/${snap} | ssh ${host} btrfs receive ${rpath}/" \
+            || log_info "[DRY-RUN] btrfs send ${src}/${snap} | ssh ${host} btrfs receive ${rpath}/"
         return 0
     fi
-
     ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" "mkdir -p '${rpath}'" 2>>"$LOG_FILE" \
-        || { log_error "Cannot create ${rpath} on ${host}"; return 1; }
-
+        || { log_error "Cannot mkdir ${rpath} on ${host}"; return 1; }
     local cmd
-    if [[ -n "$parent" ]]; then
-        log_info "Incremental send ${snap} (parent ${parent}) → ${host}:${rpath}/"
-        cmd="btrfs send -p '${src}/${parent}' '${full}' | ssh -o ConnectTimeout=10 -o BatchMode=yes '${host}' 'btrfs receive \"${rpath}/\"'"
-    else
-        log_info "Full send ${snap} → ${host}:${rpath}/"
-        cmd="btrfs send '${full}' | ssh -o ConnectTimeout=10 -o BatchMode=yes '${host}' 'btrfs receive \"${rpath}/\"'"
-    fi
-
+    [[ -n "$parent" ]] \
+        && { log_info "Send ${snap} (parent ${parent}) → ${host}:${rpath}/"; cmd="btrfs send -p '${src}/${parent}' '${src}/${snap}' | ssh -o ConnectTimeout=10 -o BatchMode=yes '${host}' 'btrfs receive \"${rpath}/\"'"; } \
+        || { log_info "Full send ${snap} → ${host}:${rpath}/"; cmd="btrfs send '${src}/${snap}' | ssh -o ConnectTimeout=10 -o BatchMode=yes '${host}' 'btrfs receive \"${rpath}/\"'"; }
     if ! eval "$cmd" 2>>"$LOG_FILE"; then
-        log_error "Remote send failed: ${snap} → ${host}:${rpath}"
+        log_error "Send failed: ${snap} → ${host}:${rpath}"
         ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
             "btrfs subvolume delete '${rpath}/${snap}' 2>/dev/null || true" 2>/dev/null || true
         return 1
     fi
-
-    snap_exists_remote "$host" "$rpath" "$snap" \
-        || { log_error "Verification failed: ${host}:${rpath}/${snap} missing after send"; return 1; }
-    log_info "Remote-sent ${snap} → ${host} ✓"
+    ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" "test -d '${rpath}/${snap}'" 2>/dev/null \
+        || { log_error "Verify failed: ${host}:${rpath}/${snap}"; return 1; }
+    log_info "OK: ${snap} → ${host}"
 }
 
-delete_snapshot() {
+delete_snap() {
     local path="$1" snap="$2"
-    if $DRY_RUN; then
-        log_info "[DRY-RUN] btrfs subvolume delete ${path}/${snap}"
-        return 0
-    fi
-    log_info "Deleting ${path}/${snap}"
+    if $DRY_RUN; then log_info "[DRY-RUN] btrfs subvolume delete ${path}/${snap}"; return 0; fi
+    log_info "Delete ${path}/${snap}"
     btrfs subvolume delete "${path}/${snap}" 2>>"$LOG_FILE" \
         || { log_error "Delete failed: ${path}/${snap}"; return 1; }
 }
 
 ###############################################################################
-# Archive retention
+# LOCAL mode: archive old snapshots to another disk, then delete from source
 ###############################################################################
 
-trim_archive() {
-    local apath="$1" keep="$2"
-    [[ "$keep" -le 0 ]] && return 0
-    local -a snaps
-    mapfile -t snaps < <(get_snapshots "$apath")
-    local total=${#snaps[@]}
-    [[ $total -le $keep ]] && return 0
-    local to_rm=$((total - keep))
-    log_info "Archive retention: removing ${to_rm} oldest from ${apath}"
-    for ((i = 0; i < to_rm; i++)); do
-        delete_snapshot "$apath" "${snaps[$i]}"
-    done
-}
+do_local() {
+    local job="$1" src="$2"
+    local -n _snaps=$3
+    local av="${job}_ARCHIVE"; local archive="${!av%/}"
+    log_info "  archive: ${archive}"
 
-###############################################################################
-# Job processing
-###############################################################################
-
-process_job() {
-    local job_name="$1"
-
-    local src_var="${job_name}_SOURCE" ; local source_path="${!src_var%/}"
-    local mode_var="${job_name}_MODE"  ; local mode="${!mode_var}"
-
-    log_info "━━━ Job: ${job_name} (${mode}) ━━━"
-    log_info "  source: ${source_path}"
-
-    if [[ ! -d "$source_path" ]]; then
-        log_error "Source path missing: ${source_path}"
-        SUMMARY+=("${job_name}: SKIPPED (source missing)")
-        return 1
-    fi
-
-    local -a src_snaps
-    mapfile -t src_snaps < <(get_snapshots "$source_path")
-    local total=${#src_snaps[@]}
-    log_info "  snapshots in source: ${total}"
-
-    if [[ "$mode" == "local" ]]; then
-        _do_local "$job_name" "$source_path" src_snaps
-    else
-        _do_remote "$job_name" "$source_path" src_snaps
-    fi
-}
-
-_do_local() {
-    local job_name="$1" source_path="$2"
-    local -n _lsnaps=$3
-
-    local arch_var="${job_name}_ARCHIVE"; local archive_path="${!arch_var%/}"
-    log_info "  archive: ${archive_path}"
-
-    local total=${#_lsnaps[@]}
+    local total=${#_snaps[@]}
     if [[ $total -le $KEEP_LOCAL ]]; then
-        log_info "  nothing to rotate (have ${total}, keep ${KEEP_LOCAL})"
-        SUMMARY+=("${job_name}: ${total} snapshot(s), nothing to rotate")
+        SUMMARY+=("${job}: ${total} snap(s), nothing to do")
         return 0
     fi
 
-    local keep_from=$((total - KEEP_LOCAL))
-    local -a to_archive=("${_lsnaps[@]:0:$keep_from}")
-    local -a to_keep=("${_lsnaps[@]:$keep_from}")
+    local split=$((total - KEEP_LOCAL))
+    local -a old=("${_snaps[@]:0:$split}")
+    local -a keep=("${_snaps[@]:$split}")
+    log_info "  archive: ${old[*]}"
+    log_info "  keep   : ${keep[*]}"
 
-    log_info "  to archive: ${to_archive[*]}"
-    log_info "  to keep   : ${to_keep[*]}"
+    local -a arch_list=()
+    mapfile -t arch_list < <(get_snapshots "$archive")
 
-    # send to local archive
-    local -a arch_snaps=()
-    mapfile -t arch_snaps < <(get_snapshots "$archive_path")
-
-    local archived=0 arch_err=0
-    for snap in "${to_archive[@]}"; do
-        if printf '%s\n' "${arch_snaps[@]}" 2>/dev/null | grep -qx "$snap"; then
-            log_info "  ${snap} already in archive"
-            ((archived++)) || true
-            continue
-        fi
-        local parent
-        parent=$(find_parent "$source_path" "$snap" "${arch_snaps[@]}")
-        if btrfs_send_local "$source_path" "$snap" "$archive_path" "$parent"; then
-            arch_snaps+=("$snap")
-            ((archived++)) || true
+    local ok=0 fail=0
+    for snap in "${old[@]}"; do
+        if in_list "$snap" "${arch_list[@]}" 2>/dev/null; then
+            log_info "  ${snap} already archived"
+            ((ok++)) || true
         else
-            ((arch_err++)) || true
+            local p; p=$(find_parent "$src" "$snap" "${arch_list[@]}")
+            if send_local "$src" "$snap" "$archive" "$p"; then
+                arch_list+=("$snap"); ((ok++)) || true
+            else
+                ((fail++)) || true; continue
+            fi
+        fi
+        # delete from source right after successful archive
+        if $DRY_RUN || [[ -d "${archive}/${snap}" ]]; then
+            delete_snap "$src" "$snap"
+        else
+            log_warn "Skip delete ${snap}: not in archive"
         fi
     done
 
-    # delete archived from source
-    local deleted=0
-    for snap in "${to_archive[@]}"; do
-        snap_exists_local "$archive_path" "$snap" 2>/dev/null \
-            || { $DRY_RUN || { log_warn "Skip delete ${snap}: not confirmed in archive"; continue; }; }
-        delete_snapshot "$source_path" "$snap" && ((deleted++)) || true
-    done
+    [[ -d "$archive" && "${KEEP_ARCHIVE:-0}" -gt 0 ]] && {
+        local -a al; mapfile -t al < <(get_snapshots "$archive")
+        local c=${#al[@]}
+        if [[ $c -gt $KEEP_ARCHIVE ]]; then
+            local rm=$((c - KEEP_ARCHIVE))
+            log_info "  Trimming archive: remove ${rm} oldest"
+            for ((i=0; i<rm; i++)); do delete_snap "$archive" "${al[$i]}"; done
+        fi
+    }
 
-    # archive retention
-    [[ -d "$archive_path" ]] && trim_archive "$archive_path" "${KEEP_ARCHIVE:-0}"
-
-    local line="${job_name}: archived=${archived} deleted=${deleted} kept=${#to_keep[@]}"
-    [[ $arch_err -gt 0 ]] && line+=" errors=${arch_err}"
+    local line="${job}: archived=${ok} kept=${#keep[@]}"
+    [[ $fail -gt 0 ]] && line+=" errors=${fail}"
     SUMMARY+=("$line")
-    log_info "  ${line}"
 }
 
-_do_remote() {
-    local job_name="$1" source_path="$2"
-    local -n _rsnaps_src=$3
+###############################################################################
+# REMOTE mode: ensure kept snapshots are on remote, then delete old from source
+#
+# Logic:
+#   1. Split into old (to delete) and keep (newest N)
+#   2. Make sure every "keep" snapshot exists on remote
+#   3. If a keep snapshot fails to send → STOP, don't delete anything
+#   4. Delete old snapshots from source
+###############################################################################
 
-    local rh_var="${job_name}_REMOTE_HOST"; local rhost="${!rh_var}"
-    local ru_var="${job_name}_REMOTE_USER"; local ruser="${!ru_var}"
-    local rp_var="${job_name}_REMOTE_PATH"; local rpath="${!rp_var%/}"
-    local host="${ruser}@${rhost}"
+do_remote() {
+    local job="$1" src="$2"
+    local -n _snaps=$3
+    local hv="${job}_REMOTE_HOST"; local rhost="${!hv}"
+    local uv="${job}_REMOTE_USER"; local ruser="${!uv}"
+    local pv="${job}_REMOTE_PATH"; local rpath="${!pv%/}"
+    local ssh_target="${ruser}@${rhost}"
+    log_info "  remote: ${ssh_target}:${rpath}"
 
-    log_info "  remote: ${host}:${rpath}"
-
-    local total=${#_rsnaps_src[@]}
+    local total=${#_snaps[@]}
     if [[ $total -le $KEEP_LOCAL ]]; then
-        log_info "  nothing to rotate (have ${total}, keep ${KEEP_LOCAL})"
-        SUMMARY+=("${job_name}: ${total} snapshot(s), nothing to rotate")
+        SUMMARY+=("${job}: ${total} snap(s), nothing to do")
         return 0
     fi
 
-    local keep_from=$((total - KEEP_LOCAL))
-    local -a to_send=("${_rsnaps_src[@]:0:$keep_from}")
-    local -a to_keep=("${_rsnaps_src[@]:$keep_from}")
-
-    log_info "  to send  : ${to_send[*]}"
-    log_info "  to keep  : ${to_keep[*]}"
+    local split=$((total - KEEP_LOCAL))
+    local -a old=("${_snaps[@]:0:$split}")
+    local -a keep=("${_snaps[@]:$split}")
+    log_info "  remove : ${old[*]}"
+    log_info "  keep   : ${keep[*]}"
 
     # test SSH
     if ! $DRY_RUN; then
-        ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" "echo ok" >/dev/null 2>&1 \
-            || { log_error "SSH unreachable: ${host}"; SUMMARY+=("${job_name}: FAILED (SSH)"); return 1; }
+        ssh -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" "echo ok" >/dev/null 2>&1 \
+            || { log_error "SSH failed: ${ssh_target}"; SUMMARY+=("${job}: FAILED (SSH)"); return 1; }
     fi
 
-    # fetch remote snapshot list once
-    local -a rsnaps=()
+    # get what's already on remote
+    local -a on_remote=()
     if ! $DRY_RUN; then
-        mapfile -t rsnaps < <(
-            ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
+        mapfile -t on_remote < <(
+            ssh -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" \
                 "ls -1 '${rpath}/' 2>/dev/null" | grep -E "$SNAP_RE" | sort
         ) || true
     fi
 
-    # send snapshots to remote
-    local sent=0 rerr=0
-    for snap in "${to_send[@]}"; do
-        if printf '%s\n' "${rsnaps[@]}" 2>/dev/null | grep -qx "$snap"; then
-            log_info "  ${snap} already on remote"
-            ((sent++)) || true
+    # step 1: make sure kept snapshots are on remote
+    local sent=0
+    for snap in "${keep[@]}"; do
+        if in_list "$snap" "${on_remote[@]}" 2>/dev/null; then
+            log_debug "  ${snap} already on remote"
             continue
         fi
-        local parent
-        parent=$(find_parent "$source_path" "$snap" "${rsnaps[@]}")
-        if btrfs_send_remote "$source_path" "$snap" "$host" "$rpath" "$parent"; then
-            rsnaps+=("$snap")
-            ((sent++)) || true
+        local p; p=$(find_parent "$src" "$snap" "${on_remote[@]}")
+        if send_remote "$src" "$snap" "$ssh_target" "$rpath" "$p"; then
+            on_remote+=("$snap"); ((sent++)) || true
         else
-            ((rerr++)) || true
+            log_error "Cannot confirm ${snap} on remote — aborting delete to protect data"
+            SUMMARY+=("${job}: ABORTED — could not send ${snap} to remote")
+            return 1
         fi
     done
 
-    # delete sent snapshots from source
+    # step 2: delete old snapshots from source (safe — kept ones are on remote)
     local deleted=0
-    for snap in "${to_send[@]}"; do
-        if ! $DRY_RUN; then
-            snap_exists_remote "$host" "$rpath" "$snap" \
-                || { log_warn "Skip delete ${snap}: not confirmed on remote"; continue; }
-        fi
-        delete_snapshot "$source_path" "$snap" && ((deleted++)) || true
+    for snap in "${old[@]}"; do
+        delete_snap "$src" "$snap" && ((deleted++)) || true
     done
 
-    local line="${job_name}: sent=${sent} deleted=${deleted} kept=${#to_keep[@]} → ${host}"
-    [[ $rerr -gt 0 ]] && line+=" errors=${rerr}"
-    SUMMARY+=("$line")
-    log_info "  ${line}"
+    SUMMARY+=("${job}: sent=${sent} deleted=${deleted} kept=${#keep[@]} → ${ssh_target}")
 }
 
 ###############################################################################
@@ -467,34 +352,24 @@ _do_remote() {
 load_config() {
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
-
-    [[ -z "${HOSTNAME_ID:-}" ]]    && die "HOSTNAME_ID not set in config"
-    [[ -z "${JOBS[*]:-}" ]]        && die "No JOBS defined in config"
+    [[ -z "${HOSTNAME_ID:-}" ]]    && die "HOSTNAME_ID not set"
+    [[ -z "${JOBS[*]:-}" ]]        && die "No JOBS defined"
     [[ "${KEEP_LOCAL:-0}" -lt 1 ]] && die "KEEP_LOCAL must be >= 1"
-
     for job in "${JOBS[@]}"; do
-        local src_var="${job}_SOURCE"
-        [[ -z "${!src_var:-}" ]] && die "Job '${job}': ${src_var} is not set"
-        local mode_var="${job}_MODE"
-        local mode="${!mode_var:-}"
-        [[ "$mode" != "local" && "$mode" != "remote" ]] && die "Job '${job}': ${mode_var} must be 'local' or 'remote'"
+        local sv="${job}_SOURCE"; [[ -z "${!sv:-}" ]] && die "${sv} not set"
+        local mv="${job}_MODE";  local mode="${!mv:-}"
+        [[ "$mode" != "local" && "$mode" != "remote" ]] && die "${mv} must be 'local' or 'remote'"
         if [[ "$mode" == "local" ]]; then
-            local arch_var="${job}_ARCHIVE"
-            [[ -z "${!arch_var:-}" ]] && die "Job '${job}': ${arch_var} is required for local mode"
+            local av="${job}_ARCHIVE"; [[ -z "${!av:-}" ]] && die "${av} required"
         else
-            local rh_var="${job}_REMOTE_HOST"
-            local ru_var="${job}_REMOTE_USER"
-            local rp_var="${job}_REMOTE_PATH"
-            [[ -z "${!rh_var:-}" ]] && die "Job '${job}': ${rh_var} is required for remote mode"
-            [[ -z "${!ru_var:-}" ]] && die "Job '${job}': ${ru_var} is required for remote mode"
-            [[ -z "${!rp_var:-}" ]] && die "Job '${job}': ${rp_var} is required for remote mode"
+            for v in REMOTE_HOST REMOTE_USER REMOTE_PATH; do
+                local vn="${job}_${v}"; [[ -z "${!vn:-}" ]] && die "${vn} required"
+            done
         fi
     done
-
     LOG_FILE="${LOG_FILE:-$DEFAULT_LOG}"
     touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/btrfs-backup.log"
-
-    log_info "Config loaded: host=${HOSTNAME_ID} jobs=${#JOBS[@]} (${JOBS[*]}) keep_local=${KEEP_LOCAL}"
+    log_info "Config: host=${HOSTNAME_ID} jobs=(${JOBS[*]}) keep=${KEEP_LOCAL}"
 }
 
 ###############################################################################
@@ -506,33 +381,46 @@ main() {
     load_config
     acquire_lock
 
-    log_info "══════════════════════════════════════════"
-    log_info " BTRFS Backup Rotation v${SCRIPT_VERSION}"
+    log_info "════════════════════════════════════════"
+    log_info " btrfs-backup-rotate v${SCRIPT_VERSION}"
     log_info " Host: ${HOSTNAME_ID}"
-    $DRY_RUN && log_info " *** DRY-RUN — nothing will be changed ***"
-    log_info "══════════════════════════════════════════"
+    $DRY_RUN && log_info " *** DRY-RUN ***"
+    log_info "════════════════════════════════════════"
 
-    local job_errors=0
-
-    for job_name in "${JOBS[@]}"; do
-        # if --job filters given, skip non-matching
+    local errs=0
+    for job in "${JOBS[@]}"; do
         if [[ ${#ONLY_JOBS[@]} -gt 0 ]]; then
-            local match=false
-            for oj in "${ONLY_JOBS[@]}"; do [[ "$oj" == "$job_name" ]] && match=true; done
-            $match || continue
+            local ok=false
+            for oj in "${ONLY_JOBS[@]}"; do [[ "$oj" == "$job" ]] && ok=true; done
+            $ok || continue
         fi
 
-        process_job "$job_name" || ((job_errors++)) || true
+        local sv="${job}_SOURCE"; local src="${!sv%/}"
+        local mv="${job}_MODE";  local mode="${!mv}"
+        log_info "━━━ ${job} (${mode}) ━━━"
+        log_info "  source: ${src}"
+
+        if [[ ! -d "$src" ]]; then
+            log_error "Source missing: ${src}"
+            SUMMARY+=("${job}: SKIPPED")
+            ((errs++)) || true; continue
+        fi
+
+        local -a snaps; mapfile -t snaps < <(get_snapshots "$src")
+        log_info "  found: ${#snaps[@]} snapshot(s)"
+
+        if [[ "$mode" == "local" ]]; then
+            do_local "$job" "$src" snaps || ((errs++)) || true
+        else
+            do_remote "$job" "$src" snaps || ((errs++)) || true
+        fi
     done
 
-    if [[ $job_errors -gt 0 || ${#ERRORS[@]} -gt 0 ]]; then
-        send_notification "FAILED"
-        log_error "Finished with errors"
-        exit 1
+    if [[ $errs -gt 0 || ${#ERRORS[@]} -gt 0 ]]; then
+        notify "FAILED"; exit 1
     fi
-
-    send_notification "OK"
-    log_info "All jobs completed successfully"
+    notify "OK"
+    log_info "Done"
 }
 
 main "$@"
