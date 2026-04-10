@@ -58,29 +58,31 @@ See [`config.example.sh`](config.example.sh) for a fully commented template.
 
 ### Job definitions
 
-List job names in `JOBS`, then define each one with clear variables:
+List job names in `JOBS`, then define each one below. Each job is **either local or remote** (never both):
+
+- **local** — archive snapshots to another BTRFS volume on the same host
+- **remote** — send snapshots to another host via SSH
 
 ```bash
 JOBS=("win_b" "linux_vm")
 
-# --- Job: win_b ---
+# --- Job: win_b (remote) ---
 win_b_SOURCE="/work/backup"
-win_b_ARCHIVE="/backuparchive/win_b"
-win_b_REMOTE="root@192.168.12.250:/backup/win_b"   # optional
+win_b_MODE="remote"
+win_b_REMOTE="root@192.168.12.250:/backup/win_b"
 
-# --- Job: linux_vm ---
+# --- Job: linux_vm (local) ---
 linux_vm_SOURCE="/data/backup"
+linux_vm_MODE="local"
 linux_vm_ARCHIVE="/backuparchive/linux_vm"
-linux_vm_REMOTE=""                                   # no remote
 ```
 
-Each job has three variables (prefixed by the job name):
-
-| Variable | Required | Description |
+| Variable | When | Description |
 |---|---|---|
-| `<job>_SOURCE` | yes | Directory containing `YYYY_MM_DD` snapshot subvolumes |
-| `<job>_ARCHIVE` | yes | Destination on a different BTRFS volume (same host) |
-| `<job>_REMOTE` | no | `user@host:/path` for SSH replication (empty = skip) |
+| `<job>_SOURCE` | always | Directory containing `YYYY_MM_DD` snapshot subvolumes |
+| `<job>_MODE` | always | `"local"` or `"remote"` |
+| `<job>_ARCHIVE` | local mode | Destination on a different BTRFS volume (same host) |
+| `<job>_REMOTE` | remote mode | `user@host:/path` for SSH send |
 
 ## CLI flags
 

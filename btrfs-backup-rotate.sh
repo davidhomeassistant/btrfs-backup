@@ -303,15 +303,11 @@ trim_archive() {
 process_job() {
     local job_name="$1"
 
-    # read per-job variables via indirect expansion
-    local src_var="${job_name}_SOURCE"  ; local source_path="${!src_var}"
-    local arch_var="${job_name}_ARCHIVE"; local archive_path="${!arch_var}"
-    local rem_var="${job_name}_REMOTE"  ; local remote_spec="${!rem_var:-}"
+    local src_var="${job_name}_SOURCE" ; local source_path="${!src_var}"
+    local mode_var="${job_name}_MODE"  ; local mode="${!mode_var}"
 
-    log_info "━━━ Job: ${job_name} ━━━"
-    log_info "  source : ${source_path}"
-    log_info "  archive: ${archive_path}"
-    [[ -n "$remote_spec" ]] && log_info "  remote : ${remote_spec}"
+    log_info "━━━ Job: ${job_name} (${mode}) ━━━"
+    log_info "  source: ${source_path}"
 
     if [[ ! -d "$source_path" ]]; then
         log_error "Source path missing: ${source_path}"
@@ -319,32 +315,42 @@ process_job() {
         return 1
     fi
 
-    # ── collect snapshots ────────────────────────────────────────────────
     local -a src_snaps
     mapfile -t src_snaps < <(get_snapshots "$source_path")
     local total=${#src_snaps[@]}
     log_info "  snapshots in source: ${total}"
 
+    if [[ "$mode" == "local" ]]; then
+        _do_local "$job_name" "$source_path" src_snaps
+    else
+        _do_remote "$job_name" "$source_path" src_snaps
+    fi
+}
+
+_do_local() {
+    local job_name="$1" source_path="$2"
+    local -n _lsnaps=$3
+
+    local arch_var="${job_name}_ARCHIVE"; local archive_path="${!arch_var}"
+    log_info "  archive: ${archive_path}"
+
+    local total=${#_lsnaps[@]}
     if [[ $total -le $KEEP_LOCAL ]]; then
         log_info "  nothing to rotate (have ${total}, keep ${KEEP_LOCAL})"
         SUMMARY+=("${job_name}: ${total} snapshot(s), nothing to rotate")
-        # still do remote if configured
-        [[ -n "$remote_spec" ]] && _do_remote "$source_path" "$remote_spec" src_snaps "$job_name"
         return 0
     fi
 
     local keep_from=$((total - KEEP_LOCAL))
-    local -a to_archive=("${src_snaps[@]:0:$keep_from}")
-    local -a to_keep=("${src_snaps[@]:$keep_from}")
+    local -a to_archive=("${_lsnaps[@]:0:$keep_from}")
+    local -a to_keep=("${_lsnaps[@]:$keep_from}")
 
     log_info "  to archive: ${to_archive[*]}"
     log_info "  to keep   : ${to_keep[*]}"
 
-    # ── phase 1: archive ─────────────────────────────────────────────────
+    # send to local archive
     local -a arch_snaps=()
-    if [[ -n "$archive_path" ]]; then
-        mapfile -t arch_snaps < <(get_snapshots "$archive_path")
-    fi
+    mapfile -t arch_snaps < <(get_snapshots "$archive_path")
 
     local archived=0 arch_err=0
     for snap in "${to_archive[@]}"; do
@@ -363,21 +369,16 @@ process_job() {
         fi
     done
 
-    # ── phase 2: remote ──────────────────────────────────────────────────
-    [[ -n "$remote_spec" ]] && _do_remote "$source_path" "$remote_spec" src_snaps "$job_name"
-
-    # ── phase 3: delete archived from source ─────────────────────────────
+    # delete archived from source
     local deleted=0
     for snap in "${to_archive[@]}"; do
-        if [[ -n "$archive_path" ]]; then
-            snap_exists_local "$archive_path" "$snap" 2>/dev/null \
-                || { $DRY_RUN || { log_warn "Skip delete ${snap}: not confirmed in archive"; continue; }; }
-        fi
+        snap_exists_local "$archive_path" "$snap" 2>/dev/null \
+            || { $DRY_RUN || { log_warn "Skip delete ${snap}: not confirmed in archive"; continue; }; }
         delete_snapshot "$source_path" "$snap" && ((deleted++)) || true
     done
 
-    # ── phase 4: archive retention ───────────────────────────────────────
-    [[ -n "$archive_path" && -d "$archive_path" ]] && trim_archive "$archive_path" "${KEEP_ARCHIVE:-0}"
+    # archive retention
+    [[ -d "$archive_path" ]] && trim_archive "$archive_path" "${KEEP_ARCHIVE:-0}"
 
     local line="${job_name}: archived=${archived} deleted=${deleted} kept=${#to_keep[@]}"
     [[ $arch_err -gt 0 ]] && line+=" errors=${arch_err}"
@@ -386,19 +387,34 @@ process_job() {
 }
 
 _do_remote() {
-    local source_path="$1" remote_spec="$2"
-    local -n _snaps=$3
-    local job_name="$4"
+    local job_name="$1" source_path="$2"
+    local -n _rsnaps_src=$3
 
+    local rem_var="${job_name}_REMOTE"; local remote_spec="${!rem_var}"
     local host="${remote_spec%%:*}"
     local rpath="${remote_spec#*:}"
     [[ -z "$host" || -z "$rpath" ]] && { log_error "Bad remote spec: ${remote_spec}"; return 1; }
 
-    log_info "  ── remote replication → ${host}:${rpath} ──"
+    log_info "  remote: ${host}:${rpath}"
 
+    local total=${#_rsnaps_src[@]}
+    if [[ $total -le $KEEP_LOCAL ]]; then
+        log_info "  nothing to rotate (have ${total}, keep ${KEEP_LOCAL})"
+        SUMMARY+=("${job_name}: ${total} snapshot(s), nothing to rotate")
+        return 0
+    fi
+
+    local keep_from=$((total - KEEP_LOCAL))
+    local -a to_send=("${_rsnaps_src[@]:0:$keep_from}")
+    local -a to_keep=("${_rsnaps_src[@]:$keep_from}")
+
+    log_info "  to send  : ${to_send[*]}"
+    log_info "  to keep  : ${to_keep[*]}"
+
+    # test SSH
     if ! $DRY_RUN; then
         ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" "echo ok" >/dev/null 2>&1 \
-            || { log_error "SSH unreachable: ${host}"; SUMMARY+=("${job_name}: remote FAILED (SSH)"); return 1; }
+            || { log_error "SSH unreachable: ${host}"; SUMMARY+=("${job_name}: FAILED (SSH)"); return 1; }
     fi
 
     # fetch remote snapshot list once
@@ -410,10 +426,12 @@ _do_remote() {
         ) || true
     fi
 
+    # send snapshots to remote
     local sent=0 rerr=0
-    for snap in "${_snaps[@]}"; do
+    for snap in "${to_send[@]}"; do
         if printf '%s\n' "${rsnaps[@]}" 2>/dev/null | grep -qx "$snap"; then
-            log_debug "  ${snap} already on remote"
+            log_info "  ${snap} already on remote"
+            ((sent++)) || true
             continue
         fi
         local parent
@@ -426,9 +444,20 @@ _do_remote() {
         fi
     done
 
-    local line="${job_name}: remote_sent=${sent} → ${host}"
-    [[ $rerr -gt 0 ]] && line+=" remote_errors=${rerr}"
+    # delete sent snapshots from source
+    local deleted=0
+    for snap in "${to_send[@]}"; do
+        if ! $DRY_RUN; then
+            snap_exists_remote "$host" "$rpath" "$snap" \
+                || { log_warn "Skip delete ${snap}: not confirmed on remote"; continue; }
+        fi
+        delete_snapshot "$source_path" "$snap" && ((deleted++)) || true
+    done
+
+    local line="${job_name}: sent=${sent} deleted=${deleted} kept=${#to_keep[@]} → ${host}"
+    [[ $rerr -gt 0 ]] && line+=" errors=${rerr}"
     SUMMARY+=("$line")
+    log_info "  ${line}"
 }
 
 ###############################################################################
@@ -443,12 +472,19 @@ load_config() {
     [[ -z "${JOBS[*]:-}" ]]        && die "No JOBS defined in config"
     [[ "${KEEP_LOCAL:-0}" -lt 1 ]] && die "KEEP_LOCAL must be >= 1"
 
-    # validate that each job has at least a _SOURCE defined
     for job in "${JOBS[@]}"; do
         local src_var="${job}_SOURCE"
-        [[ -z "${!src_var:-}" ]] && die "Job '${job}': ${src_var} is not set in config"
-        local arch_var="${job}_ARCHIVE"
-        [[ -z "${!arch_var:-}" ]] && die "Job '${job}': ${arch_var} is not set in config"
+        [[ -z "${!src_var:-}" ]] && die "Job '${job}': ${src_var} is not set"
+        local mode_var="${job}_MODE"
+        local mode="${!mode_var:-}"
+        [[ "$mode" != "local" && "$mode" != "remote" ]] && die "Job '${job}': ${mode_var} must be 'local' or 'remote'"
+        if [[ "$mode" == "local" ]]; then
+            local arch_var="${job}_ARCHIVE"
+            [[ -z "${!arch_var:-}" ]] && die "Job '${job}': ${arch_var} is required for local mode"
+        else
+            local rem_var="${job}_REMOTE"
+            [[ -z "${!rem_var:-}" ]] && die "Job '${job}': ${rem_var} is required for remote mode"
+        fi
     done
 
     LOG_FILE="${LOG_FILE:-$DEFAULT_LOG}"
