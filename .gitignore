@@ -1,15 +1,4 @@
-# Host configs contain Telegram tokens — keep them out of git.
-# Commit config.example.sh instead and copy per host.
-configs/*.sh
-!config.example.sh
-
-# Logs
 *.log
-
-# Lock files
 *.lock
-
-# Editor swap
 *.swp
-*.swo
 *~
