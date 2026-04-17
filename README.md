@@ -69,7 +69,7 @@ chmod +x /usr/local/bin/kvm-btrfs-backup.sh
 3. Edit the variables at the top of the script:
 
 ```bash
-nano /usr/local/bin/kvm-btrfs-backup.sh
+vim /usr/local/bin/kvm-btrfs-backup.sh
 ```
 
 4. Test Telegram notification (no backup runs):

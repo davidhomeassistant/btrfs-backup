@@ -1,0 +1,8 @@
+---
+description: User preferences for tools and editors
+alwaysApply: true
+---
+
+# User Preferences
+
+- Always use `vim` for editing files on remote servers. Never suggest `nano`.
